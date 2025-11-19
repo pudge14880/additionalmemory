@@ -1,0 +1,198 @@
+import torch
+import gc
+from unsloth import FastLanguageModel
+from langchain_huggingface import HuggingFacePipeline, HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
+from langchain.chains.summarize import load_summarize_chain
+from langchain.docstore.document import Document
+
+class LocalRAGPipeline:
+    def __init__(self, model_id, max_seq_length=8192):
+        """
+        Инициализация модели и токенизатора.
+        model_id: путь к модели huggingface/unsloth
+        max_seq_length: ограничение контекста (снизьте до 4096, если используете 32B модель!)
+        """
+        self.model_id = model_id
+        self.max_seq_length = max_seq_length
+        self.vector_db = None
+        self.llm = None
+        
+        # 1. Загрузка LLM
+        print(f"--- Загрузка LLM: {model_id} ---")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_id,
+            max_seq_length=max_seq_length,
+            dtype=None, 
+            load_in_4bit=True, # Обязательно для экономии памяти
+        )
+        FastLanguageModel.for_inference(model)
+        
+        # Создаем пайплайн генерации
+        pipeline = torch.pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=2048,
+            temperature=0.2,
+            repetition_penalty=1.15,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        # Обертка для LangChain
+        self.llm = HuggingFacePipeline(pipeline=pipeline)
+
+        # 2. Загрузка модели Эмбеддингов (Строго на CPU)
+        print("--- Загрузка Embeddings (CPU) ---")
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="intfloat/multilingual-e5-large",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
+
+    def load_documents(self, file_paths):
+        """Загружает документы и создает векторную базу"""
+        documents = []
+        if isinstance(file_paths, str): file_paths = [file_paths]
+
+        for file_path in file_paths:
+            print(f"Обработка: {file_path}")
+            if file_path.endswith(".pdf"): loader = PyPDFLoader(file_path)
+            elif file_path.endswith(".docx"): loader = Docx2txtLoader(file_path)
+            else: loader = TextLoader(file_path, encoding='utf-8')
+            documents.extend(loader.load())
+
+        # Нарезка текста
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        self.texts = text_splitter.split_documents(documents)
+
+        # Создание базы (в памяти)
+        # Очистка старой базы если была
+        if self.vector_db: 
+            self.vector_db.delete_collection()
+            
+        self.vector_db = Chroma.from_documents(
+            documents=self.texts, 
+            embedding=self.embeddings,
+            collection_name="local_rag"
+        )
+        print(f"База создана! Загружено фрагментов: {len(self.texts)}")
+        return len(self.texts)
+
+    def chat_rag(self, query, k=3):
+        """Режим RAG: Ответ на вопрос по документам"""
+        if not self.vector_db:
+            return "Сначала загрузите документы через load_documents()"
+
+        prompt_template = """Действуй как аналитик. Используй контекст ниже, чтобы ответить на вопрос.
+        Если информации нет в контексте, скажи "В документе нет информации".
+        Отвечай на русском языке, структурированно.
+
+        КОНТЕКСТ:
+        {context}
+
+        ВОПРОС: {question}
+        ОТВЕТ:"""
+
+        PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=self.vector_db.as_retriever(search_kwargs={"k": k}),
+            chain_type_kwargs={"prompt": PROMPT}
+        )
+        
+        result = qa_chain.invoke({"query": query})
+        return result["result"]
+
+    def summarize(self, method="map_reduce"):
+        """
+        Режим Суммаризации.
+        method: 
+          'stuff' - если текст влазит в контекст (быстро).
+          'map_reduce' - если текст огромный (долго, но надежно).
+        """
+        if not getattr(self, 'texts', None):
+            return "Нет загруженных текстов."
+
+        print(f"--- Начало суммаризации (Метод: {method}) ---")
+        
+        if method == "map_reduce":
+            # Промпты для Map-Reduce (чтобы не потерять смысл на этапах)
+            map_prompt = """Прочитай следующий текст и выпиши ключевые тезисы:
+            "{text}"
+            Краткие тезисы:"""
+            MAP_PROMPT = PromptTemplate(template=map_prompt, input_variables=["text"])
+
+            combine_prompt = """Объедини следующие тезисы в единый связный пересказ текста на русском языке. 
+            Выдели главное, используй маркеры списков.
+            
+            ТЕЗИСЫ:
+            "{text}"
+            
+            ПОЛНЫЙ ПЕРЕСКАЗ:"""
+            COMBINE_PROMPT = PromptTemplate(template=combine_prompt, input_variables=["text"])
+            
+            chain = load_summarize_chain(
+                self.llm, 
+                chain_type="map_reduce", 
+                map_prompt=MAP_PROMPT,
+                combine_prompt=COMBINE_PROMPT,
+                verbose=True
+            )
+        else:
+            # Stuff (все в один промпт)
+            chain = load_summarize_chain(self.llm, chain_type="stuff", verbose=True)
+
+        # Если map_reduce, LangChain сам обработает все чанки. 
+        # Если stuff - нужно убедиться, что мы не подаем слишком много, но chain сам попробует.
+        res = chain.invoke(self.texts)
+        return res['output_text']
+
+    def clean_memory(self):
+        """Очистка VRAM (полезно при смене моделей, но тут мы используем одну)"""
+        torch.cuda.empty_cache()
+        gc.collect()
+
+# ==========================================
+# ПРИМЕР ЗАПУСКА
+# ==========================================
+if __name__ == "__main__":
+    # ВЫБЕРИТЕ МОДЕЛЬ:
+    
+    # Вариант 1: Qwen 32B (Рискованно для 20GB VRAM)
+    # model_name = "unsloth/Qwen2.5-32B-Instruct-bnb-4bit"
+    # context_limit = 4096 # Ставим меньше, чтобы влезть
+    
+    # Вариант 2: Gemma 2 27B (Рекомендуемая альтернатива, высокое качество)
+    # model_name = "unsloth/gemma-2-27b-it-bnb-4bit" 
+    # context_limit = 6000
+
+    # Вариант 3: Qwen 14B (Лучшая скорость и работа с большими доками)
+    model_name = "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"
+    context_limit = 16384 
+
+    # Инициализация
+    bot = LocalRAGPipeline(model_id=model_name, max_seq_length=context_limit)
+
+    # Загрузка файла (укажите свой путь)
+    # bot.load_documents("contract.pdf") 
+    
+    # Тест (создадим фиктивный документ для проверки кода)
+    dummy_text = "Гайд по использованию локальных LLM. " * 500
+    with open("test_doc.txt", "w", encoding="utf-8") as f: f.write(dummy_text)
+    bot.load_documents("test_doc.txt")
+
+    # Сценарий 1: RAG
+    print("\n>>> Ответ на вопрос:")
+    print(bot.chat_rag("О чем этот текст?"))
+
+    # Сценарий 2: Суммаризация
+    print("\n>>> Суммаризация:")
+    # Для больших документов используйте "map_reduce", для мелких "stuff"
+    print(bot.summarize(method="stuff"))
